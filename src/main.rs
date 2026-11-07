@@ -1,9 +1,23 @@
-use std::collections::{HashMap, vec_deque};
-use std::collections::btree_map::Values;
+use std::collections::HashMap;
 use std::fs::File;
-use std::fs::OpenOptions;
-use std::{fs, vec};
-use std::io::{self, BufRead, BufReader, BufWriter, Lines, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+
+fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut len_buf = [0u8; 4];
+
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf);
+
+    String::from_utf8(buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
 //store struct
 struct Store {
@@ -29,17 +43,11 @@ impl Store {
         let file = File::create(&self.save_directory)?;
         let mut writer = BufWriter::new(file);
 
-        let kvsep = " ".as_bytes();
-        let linesep = "\n".as_bytes();
-
         for (key, value) in &self.map {
-            let keybytes = key.as_bytes();
-            let valbytes = value.as_bytes();
-
-            writer.write_all(&keybytes)?;
-            writer.write_all(&kvsep)?;
-            writer.write_all(&valbytes)?;
-            writer.write_all(&linesep)?;
+            writer.write_all(&(key.len() as u32).to_le_bytes())?;
+            writer.write_all(&key.as_bytes())?;
+            writer.write_all(&(value.len() as u32).to_le_bytes())?;
+            writer.write_all(&value.as_bytes())?;
         }
 
         writer.flush()?;
@@ -55,12 +63,14 @@ impl Store {
             Err(e) => return Err(e),
         };
 
-        for line in BufReader::new(file).lines() {
-            let line = line?;
+        let mut reader = BufReader::new(file);
 
-            if let Some((key, value)) = line.split_once(' ') {
-                self.map.insert(key.to_string(), value.to_string());
-            }
+        while let Some(key) = read_chunk(&mut reader)? {
+            let val = read_chunk(&mut reader)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Key without a value")
+            })?;
+
+            self.map.insert(key, val);
         }
 
         Ok(())
