@@ -29,7 +29,13 @@ impl Store {
         let file = File::create(&self.save_directory)?;
         let mut writer = BufWriter::new(file);
 
+        let kvsep = " ".as_bytes();
+        let linesep = "\n".as_bytes();
+
         for (key, value) in &self.map {
+            let keybytes = key.as_bytes();
+            let valbytes = value.as_bytes();
+
             writer.write_all(&keybytes)?;
             writer.write_all(&kvsep)?;
             writer.write_all(&valbytes)?;
