@@ -1,6 +1,17 @@
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions, read};
+use std::io::ErrorKind::Other;
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+
+//function tags
+const PUT: u8 = 0;
+const DEL: u8 = 1;
+const CLEAR: u8 = 2;
+
+fn write_chunk<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())
+}
 
 fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
     let mut len_buf = [0u8; 4];
@@ -26,52 +37,59 @@ struct Store {
 
     //file location for saving and loading from
     save_directory: String,
+
+    //file handle to write updates in real time
+    log: BufWriter<File>,
 }
 
 impl Store {
     //constructor
     //called using Store::new(...)
-    fn new() -> Self {
-        Store {
+    fn new(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+
+        let mut store = Store {
             map: HashMap::new(),
-            save_directory: "save.bin".to_string(),
-        }
-    }
+            save_directory: path.to_string(),
+            log:  BufWriter::new(file),
+        };
 
-    fn save(&self) -> io::Result<()>  {
-        //write to binary file
-        let file = File::create(&self.save_directory)?;
-        let mut writer = BufWriter::new(file);
-
-        for (key, value) in &self.map {
-            writer.write_all(&(key.len() as u32).to_le_bytes())?;
-            writer.write_all(&key.as_bytes())?;
-            writer.write_all(&(value.len() as u32).to_le_bytes())?;
-            writer.write_all(&value.as_bytes())?;
-        }
-
-        writer.flush()?;
-
-        Ok(())
+        store.load()?;
+        Ok(store)
     }
 
     fn load(&mut self) -> io::Result<()> {
-        let file = match File::open(&self.save_directory) {
-            Ok(f) => f,
-            
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
+        let mut reader = BufReader::new(File::open(&self.save_directory)?);
 
-        let mut reader = BufReader::new(file);
+        loop {
+            let mut tag = [0u8; 1];
 
-        while let Some(key) = read_chunk(&mut reader)? {
-            let val = read_chunk(&mut reader)?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "Key without a value")
-            })?;
+            match reader.read_exact(&mut tag) {
+                Ok(()) => {}
 
-            self.map.insert(key, val);
-        }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+
+            match tag[0] {
+                PUT => {
+                    let key = read_chunk(&mut reader)?;
+                    let val = read_chunk(&mut reader)?;
+                    self.map.insert(key.unwrap(), val.unwrap());
+                }
+                DEL => {
+                    let key = read_chunk(&mut reader)?;
+                    self.map.remove(&key.unwrap());
+                }
+                CLEAR => self.map.clear(),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown record tag {other}"),
+                    ));
+                }
+            }
+        }        
 
         Ok(())
     }
@@ -83,27 +101,44 @@ impl Store {
     }
 
     //enters a value into the db
-    fn put(&mut self, key: String, value: String) {
+    fn put(&mut self, key: String, value: String) -> io::Result<()> {
+        self.log.write_all(&[PUT]);
+        write_chunk(&mut self.log, &key);
+        write_chunk(&mut self.log, &value);
+        self.log.flush();
+
         self.map.insert(key, value);
+        Ok(())
     }
 
     //returns removed value
-    fn del(&mut self, key: &str) -> Option<String> {
-        self.map.remove(key)
+    fn del(&mut self, key: &str) -> io::Result<Option<String>> {
+        if(!self.map.contains_key(key)){
+            return Ok(None);
+        }
+
+        self.log.write_all(&[DEL])?;
+        write_chunk(&mut self.log, key);
+        self.log.flush();
+
+        Ok(self.map.remove(key))
     }
 
     //clears the map
-    fn clear(&mut self) {
+    fn clear(&mut self) -> io::Result<()> {
+        self.log.write_all(&[CLEAR])?;
+        self.log.flush()?;
+
         self.map.clear();
+
+        Ok(())
     }
 }
 
 fn main() {
-    let mut store = Store::new();
+    let mut store = Store::new("save.bin").expect("Failed to open store");
 
     io::stdout().flush().expect("Failed to flush stdout");
-
-    store.load().expect("Failed to load save file.");
 
     let mut conf_clear = false;
 
@@ -123,7 +158,7 @@ fn main() {
         //replacement for if/else chains
         match args.as_slice() {
             ["put", key, value] => {
-                store.put(key.to_string(), value.to_string());
+                store.put(key.to_string(), value.to_string()).expect("Failed to write key to store");
                 println!("Set key {key} to value {value} successfully");
             }
 
@@ -136,7 +171,7 @@ fn main() {
                 }
             }
 
-            ["del", key] => match store.del(key) {
+            ["del", key] => match store.del(key).expect("Failed to write deletion of key") {
                 Some(v) => {
                     println!("Key {key} deleted successfully")
                 }
@@ -171,7 +206,5 @@ fn main() {
             _ => println!("Unknown commmand")
         }
     }
-
-    store.save().expect("Failed to save to file");
 
 }
