@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
+use std::io::Seek;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 //function tags
@@ -8,10 +9,11 @@ const DEL: u8 = 1;
 const CLEAR: u8 = 2;
 
 //const variables
-const MAX_WRITE: u32 = 1024;
+//64 MB
+const MAX_READ_WRITE: u32 = 64 * 1024 * 1024;
 
 fn write_chunk<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    let len = (s.len() as u32).min(MAX_WRITE);
+    let len = (s.len() as u32).min(MAX_READ_WRITE);
  
     w.write_all(&(len).to_le_bytes())?;
     w.write_all(s.as_bytes())
@@ -26,18 +28,25 @@ fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
         Err(e) => return Err(e),
     }
 
-    let len = (u32::from_le_bytes(len_buf) as usize);
+    let len = u32::from_le_bytes(len_buf) as usize;
 
-    let mut buf = vec![0u8; len];
-
-    match reader.read_exact(&mut buf) {
-        Ok(_) => {},
-        Err(e) => {
-            println!("Failed to read buf");
-        }
+    if len > MAX_READ_WRITE.try_into().unwrap() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("chunk length {len} exceeds limit of {MAX_READ_WRITE}!")
+        ))
     }
 
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+
     String::from_utf8(buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn read_required<R: Read>(reader: &mut R) -> io::Result<String> {
+    read_chunk(reader)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "Trunctuated record")
+    })
 }
 
 //store struct
@@ -72,6 +81,8 @@ impl Store {
         let mut reader = BufReader::new(File::open(&self.save_directory)?);
 
         loop {
+            let record_start = reader.stream_position()?;
+
             let mut tag = [0u8; 1];
 
             match reader.read_exact(&mut tag) {
@@ -81,25 +92,39 @@ impl Store {
                 Err(e) => return Err(e),
             }
 
+            let result: io::Result<()> = (|| {
             match tag[0] {
-                PUT => {
-                    let key = read_chunk(&mut reader)?;
-                    let val = read_chunk(&mut reader)?;
-                    self.map.insert(key.unwrap(), val.unwrap());
-                }
-                
-                DEL => {
-                    let key = read_chunk(&mut reader)?;
-                    self.map.remove(&key.unwrap());
-                }
+                    PUT => {
+                        let key = read_required(&mut reader)?;
+                        let val = read_required(&mut reader)?;
+                        self.map.insert(key, val);
+                    }
 
-                CLEAR => self.map.clear(),
+                    DEL => {
+                        let key = read_required(&mut reader)?;
+                        self.map.remove(&key);
+                    }
 
-                other => {
-                    return Err(io::Error::new(
+                    CLEAR => self.map.clear(),
+
+                    other => {
+                        return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("unknown record tag {other}"),
-                    ));
+                        ));
+                    }
+                }
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {},
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    OpenOptions::new().write(true).open(&self.save_directory)?.set_len(record_start)?;
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
                 }
             }
         }        
@@ -117,28 +142,28 @@ impl Store {
     fn put(&mut self, key: String, value: String) -> io::Result<()> {
         match self.log.write_all(&[PUT]) {
             Ok(_) => {},
-            Err(e) => {
+            Err(_) => {
                 println!("Failed to write to log within put cmd");
             }
         }
 
         match write_chunk(&mut self.log, &key) {
             Ok(_) => {},
-            Err(e) => {
+            Err(_) => {
                 println!("Failed to write to log within put cmd");
             }
         }
 
         match write_chunk(&mut self.log, &value) {
             Ok(_) => {},
-            Err(e) => {
+            Err(_) => {
                 println!("Failed to write to log within put cmd");
             }
         }
 
         match self.log.flush() {
             Ok(_) => {},
-            Err(e) => {
+            Err(_) => {
                 println!("Failed to flush write log");
             }
         }
@@ -149,7 +174,7 @@ impl Store {
 
     //returns removed value
     fn del(&mut self, key: &str) -> io::Result<Option<String>> {
-        if(!self.map.contains_key(key)){
+        if !self.map.contains_key(key) {
             return Ok(None);
         }
 
@@ -197,7 +222,7 @@ fn main() {
         let mut input = String::new();
         let bytes = io::stdin().read_line(&mut input).expect("Failed to read line");
 
-        if(bytes==0){
+        if bytes==0 {
             break;
         }
 
@@ -220,7 +245,7 @@ fn main() {
             }
 
             ["del", key] => match store.del(key).expect("Failed to write deletion of key") {
-                Some(v) => {
+                Some(_) => {
                     println!("Key {key} deleted successfully")
                 }
 
@@ -240,7 +265,7 @@ fn main() {
             }
 
             ["clear"] => {
-                if(!conf_clear){
+                if !conf_clear {
                     println!("Are you sure you want to clear all keys? Retype 'clear' to confirm");
                     conf_clear=true;
                 } else {
