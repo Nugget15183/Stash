@@ -19,7 +19,7 @@ fn write_chunk<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     w.write_all(s.as_bytes())
 }
 
-fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
+fn read_chunk<R: Read + Seek>(reader: &mut R, file_len: u64) -> io::Result<Option<String>> {
     let mut len_buf = [0u8; 4];
 
     match reader.read_exact(&mut len_buf) {
@@ -29,6 +29,11 @@ fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
     }
 
     let len = u32::from_le_bytes(len_buf) as usize;
+    let pos = reader.stream_position()?;
+
+    if len as u64 > file_len.saturating_sub(pos) {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Record extends past end of file"));
+    }
 
     if len > MAX_READ_WRITE.try_into().unwrap() {
         return Err(io::Error::new(
@@ -43,8 +48,8 @@ fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
     String::from_utf8(buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn read_required<R: Read>(reader: &mut R) -> io::Result<String> {
-    read_chunk(reader)?.ok_or_else(|| {
+fn read_required<R: Read + Seek>(reader: &mut R, file_len: u64) -> io::Result<String> {
+    read_chunk(reader, file_len)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "Trunctuated record")
     })
 }
@@ -78,7 +83,9 @@ impl Store {
     }
 
     fn load(&mut self) -> io::Result<()> {
-        let mut reader = BufReader::new(File::open(&self.save_directory)?);
+        let file = File::open(&self.save_directory)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
 
         loop {
             let record_start = reader.stream_position()?;
@@ -95,13 +102,13 @@ impl Store {
             let result: io::Result<()> = (|| {
             match tag[0] {
                     PUT => {
-                        let key = read_required(&mut reader)?;
-                        let val = read_required(&mut reader)?;
+                        let key = read_required(&mut reader, file_len)?;
+                        let val = read_required(&mut reader, file_len)?;
                         self.map.insert(key, val);
                     }
 
                     DEL => {
-                        let key = read_required(&mut reader)?;
+                        let key = read_required(&mut reader, file_len)?;
                         self.map.remove(&key);
                     }
 
@@ -209,7 +216,14 @@ impl Store {
 }
 
 fn main() {
-    let mut store = Store::new("save.bin").expect("Failed to open store");
+    let mut store = match Store::new("save.bin") {
+        Ok(s) => s,
+
+        Err(e) => {
+            eprintln!("Failed to open store: {e}");
+            std::process::exit(1);
+        },
+    };
 
     io::stdout().flush().expect("Failed to flush stdout");
 
