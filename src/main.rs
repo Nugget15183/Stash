@@ -1,15 +1,19 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions, read};
-use std::io::ErrorKind::Other;
-use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 //function tags
 const PUT: u8 = 0;
 const DEL: u8 = 1;
 const CLEAR: u8 = 2;
 
+//const variables
+const MAX_WRITE: u32 = 1024;
+
 fn write_chunk<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    let len = (s.len() as u32).min(MAX_WRITE);
+ 
+    w.write_all(&(len).to_le_bytes())?;
     w.write_all(s.as_bytes())
 }
 
@@ -22,10 +26,16 @@ fn read_chunk<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
         Err(e) => return Err(e),
     }
 
-    let len = u32::from_le_bytes(len_buf) as usize;
+    let len = (u32::from_le_bytes(len_buf) as usize);
 
     let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf);
+
+    match reader.read_exact(&mut buf) {
+        Ok(_) => {},
+        Err(e) => {
+            println!("Failed to read buf");
+        }
+    }
 
     String::from_utf8(buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -77,11 +87,14 @@ impl Store {
                     let val = read_chunk(&mut reader)?;
                     self.map.insert(key.unwrap(), val.unwrap());
                 }
+                
                 DEL => {
                     let key = read_chunk(&mut reader)?;
                     self.map.remove(&key.unwrap());
                 }
+
                 CLEAR => self.map.clear(),
+
                 other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -102,10 +115,33 @@ impl Store {
 
     //enters a value into the db
     fn put(&mut self, key: String, value: String) -> io::Result<()> {
-        self.log.write_all(&[PUT]);
-        write_chunk(&mut self.log, &key);
-        write_chunk(&mut self.log, &value);
-        self.log.flush();
+        match self.log.write_all(&[PUT]) {
+            Ok(_) => {},
+            Err(e) => {
+                println!("Failed to write to log within put cmd");
+            }
+        }
+
+        match write_chunk(&mut self.log, &key) {
+            Ok(_) => {},
+            Err(e) => {
+                println!("Failed to write to log within put cmd");
+            }
+        }
+
+        match write_chunk(&mut self.log, &value) {
+            Ok(_) => {},
+            Err(e) => {
+                println!("Failed to write to log within put cmd");
+            }
+        }
+
+        match self.log.flush() {
+            Ok(_) => {},
+            Err(e) => {
+                println!("Failed to flush write log");
+            }
+        }
 
         self.map.insert(key, value);
         Ok(())
@@ -118,8 +154,20 @@ impl Store {
         }
 
         self.log.write_all(&[DEL])?;
-        write_chunk(&mut self.log, key);
-        self.log.flush();
+
+        match write_chunk(&mut self.log, key) {
+            Ok(_) => {},
+            Err(_) => {
+                println!("Failed to write deletion");
+            },
+        }
+
+        match self.log.flush() {
+            Ok(_) => {},
+            Err(_) => {
+                println!("Failed to flush deletion log");
+            },
+        }
 
         Ok(self.map.remove(key))
     }
@@ -196,9 +244,15 @@ fn main() {
                     println!("Are you sure you want to clear all keys? Retype 'clear' to confirm");
                     conf_clear=true;
                 } else {
-                    store.clear();
+                    match store.clear() {
+                        Ok(_) => {
+                            println!("Cleared all keys in the store successfully");
+                        },
+                        Err(_) => {
+                            println!("Failed to clear store.");
+                        },
+                    }
                     conf_clear=false;
-                    println!("Cleared all keys in the store successfully");
                 }
             }
 
