@@ -2,8 +2,7 @@ use std::{io::{self, Write},};
 use crate::{Store};
 
 pub fn terminal() {
-    let mut  repair = std::env::args().any(|a| a == "--repair");
-    repair=true;
+    let repair = std::env::args().any(|a| a == "--repair");
 
     let mut store = if repair {
         let (store, _) = match Store::open_repair("save.bin") {
