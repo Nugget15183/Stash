@@ -1,17 +1,13 @@
+use chrono::{Local, Utc};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind::InvalidData;
-use std::io::Seek;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 
-//function tags
-const PUT: u8 = 0;
-const DEL: u8 = 1;
-const CLEAR: u8 = 2;
+use crate::load::LoadReport;
 
-//const variables
-//64 MB
-const MAX_CHUNK: usize = 64 * 1024 * 1024;
+mod consts;
+mod examples;
+mod load;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -21,8 +17,11 @@ fn encode_record(tag: u8, chunks: &[&str]) -> io::Result<Vec<u8>> {
     let mut payload = vec![tag];
 
     for c in chunks {
-        if c.len() > MAX_CHUNK {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Key or Value too large"))
+        if c.len() > consts::MAX_CHUNK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Key or Value too large",
+            ));
         }
 
         payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
@@ -55,8 +54,6 @@ fn take_chunk(buf: &mut &[u8]) -> io::Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|e| invalid(e.to_string()))
 }
 
-//commands
-
 //store struct
 struct Store {
     //the hashmap storage itself
@@ -70,104 +67,155 @@ struct Store {
 }
 
 impl Store {
-    //constructor
-    //called using Store::new(...)
-    fn new(path: &str) -> io::Result<Self> {
-        let file = OpenOptions::new().append(true).create(true).open(path)?;
-
-        let mut store = Store {
-            map: HashMap::new(),
-            save_directory: path.to_string(),
-            log:  BufWriter::new(file),
-        };
-
-        store.load()?;
-        Ok(store)
-    }
-
     fn apply(&mut self, payload: &[u8]) -> io::Result<()> {
-        let (&tag, mut rest) = payload.split_first().ok_or_else(|| invalid("empty payload"))?;
+        let (&tag, mut rest) = payload
+            .split_first()
+            .ok_or_else(|| invalid("empty payload"))?;
 
         match tag {
-            PUT => {
+            consts::PUT => {
                 let key = take_chunk(&mut rest)?;
                 let val = take_chunk(&mut rest)?;
                 self.map.insert(key, val);
             }
 
-            DEL => {
+            consts::DEL => {
                 let key = take_chunk(&mut rest)?;
                 self.map.remove(&key);
             }
 
-            CLEAR => {
-                self.map.clear();
-            }
+            consts::CLEAR => self.map.clear(),
 
-            other => {
-                return Err(invalid(format!("Unknown tag {other}")));
-            }
+            other => return Err(invalid(format!("Unknown tag {other}"))),
         }
 
         Ok(())
     }
 
-    fn load(&mut self) -> io::Result<()> {
-        let file = File::open(&self.save_directory)?;
+    fn remove_bad(&mut self, bad_start: u64, bad_end: u64) -> io::Result<()> {
+        self.log.flush()?;
 
-        let file_len = file.metadata()?.len();
+        let buf = fs::read(&self.save_directory)?;
 
-        let mut reader = BufReader::new(file);
+        let blen: u64 = buf.len() as u64;
 
-        let mut good_end:u64 = 0;
-        let mut torn = false;
-
-        while good_end < file_len {
-            let mut header = [0u8; 8];
-
-            match reader.read_exact(&mut header) {
-                Ok(()) => {},
-
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    torn = true; 
-                    break;
-                }
-
-                Err(e) => return Err(e),
-            }
-
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
-            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-
-            let record_end = good_end + 8 + len;
-
-            if record_end > file_len {
-                torn = true;
-                break;
-            }
-
-            let mut payload = vec![0u8; len as usize];//bound by filesize
-            reader.read_exact(&mut payload)?;
-
-            if crc32fast::hash(&payload) != crc {
-                if record_end == file_len {
-                    torn = true;
-                    break;
-                }
-                return Err(invalid(format!("Checksum mismatch in record at byte {good_end}")));
-            }
-
-            self.apply(&payload)?;
-            good_end=record_end;
+        if bad_start > bad_end || bad_end > blen as u64 {
+            return Err(invalid(format!(
+                "Bad range {bad_start}..{bad_end} is invalid for the file of {} bytes",
+                blen
+            )));
         }
 
-        if torn {
-            eprintln!("warning: discarded incomplete record at byte {good_end}");
+        let (start, end) = (bad_start as usize, bad_end as usize);
 
-            OpenOptions::new().write(true).open(&self.save_directory)?.set_len(good_end)?;
-        }
+        let temp_dir = format!("{}.tmp", &self.save_directory);
+
+        let mut out = File::create(&temp_dir)?;
+        out.write_all(&buf[..start])?;
+        out.write_all(&buf[end..])?;
+        out.sync_all()?;
+
+        fs::rename(&temp_dir, &self.save_directory)?;
+
+        let file = OpenOptions::new().append(true).open(&self.save_directory)?;
+        self.log = BufWriter::new(file);
 
         Ok(())
+    }
+
+    fn load(&mut self, repair: bool) -> io::Result<load::LoadReport> {
+        let file = File::open(&self.save_directory)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+
+        let mut report = load::LoadReport::default();
+        let mut pos: u64 = 0;
+        let mut pending: Option<(u64, u64)> = None;
+
+        while pos < file_len {
+            match load::read_record(&mut reader, pos, file_len)? {
+                load::Rec::Ok { payload, end } => {
+                    self.apply(&payload)?;
+
+                    if let Some(range) = pending.take() {
+                        report.bad_ranges.push(range); //last len was verified
+                    }
+                    pos = end;
+                }
+
+                load::Rec::BadCrc { end } => {
+                    if let Some((start, _)) = pending.take() {
+                        //2 bad recs in a row means cut everything after, cant verify length was preserved
+                        report.truncate_at = Some(start);
+                        break;
+                    }
+
+                    if end == file_len {
+                        //damaged final rec
+                        report.truncate_at = Some(pos);
+                        break;
+                    }
+
+                    if !repair {
+                        return Err(invalid(format!(
+                            "checksum mismatched in record at byte {pos}"
+                        )));
+                    }
+
+                    pending = Some((pos, end));
+                    pos = end;
+                }
+
+                load::Rec::Torn {} => {
+                    //bad rec was pending its len is wrong so truncate it
+                    report.truncate_at = Some(pending.take().map_or(pos, |(start, _)| start));
+                    break;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn open(path: &str, repair: bool) -> io::Result<(Self, load::LoadReport)> {
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+
+        if repair {
+            let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+            let fpath = format!("{path}.{stamp}.bak"); 
+
+            fs::copy(path, fpath)?;
+        }
+
+        let mut store = Store {
+            map: HashMap::new(),
+            save_directory: path.to_string(),
+            log: BufWriter::new(file),
+        };
+
+        let report = store.load(repair)?;
+
+        if let Some(t) = report.truncate_at {
+            eprintln!("warning: discarded everything from byte {t}");
+            OpenOptions::new().write(true).open(path)?.set_len(t)?;
+        }
+
+        // last to first, so earlier offsets stay valid
+        for &(start, end) in report.bad_ranges.iter().rev() {
+            store.remove_bad(start, end)?;
+        }
+
+        Ok((store, report))
+    }
+
+    //constructor
+    //called using Store::new(...)
+    fn new(path: &str) -> io::Result<Self> {
+        Ok(Self::open(path, false)?.0)
+    }
+
+    fn open_repair(path: &str) -> io::Result<(Self, LoadReport)> {
+        Self::open(path, true)
     }
 
     //read only
@@ -176,7 +224,6 @@ impl Store {
         self.map.get(key)
     }
 
-    
     fn append(&mut self, rec: &[u8]) -> io::Result<()> {
         self.log.write_all(rec)?;
         self.log.flush()?;
@@ -184,15 +231,14 @@ impl Store {
         Ok(())
     }
 
-
     //enters a value into the db
     fn put(&mut self, key: String, value: String) -> io::Result<()> {
-       let rec = encode_record(PUT, &[&key, &value])?;
+        let rec = encode_record(consts::PUT, &[&key, &value])?;
 
-       self.append(&rec)?;
-       self.map.insert(key, value);
+        self.append(&rec)?;
+        self.map.insert(key, value);
 
-       Ok(())
+        Ok(())
     }
 
     //returns removed value
@@ -201,7 +247,7 @@ impl Store {
             return Ok(None);
         }
 
-        let rec = encode_record(DEL, &[key])?;
+        let rec = encode_record(consts::DEL, &[key])?;
         self.append(&rec)?;
 
         Ok(self.map.remove(key))
@@ -209,7 +255,7 @@ impl Store {
 
     //clears the map
     fn clear(&mut self) -> io::Result<()> {
-        let rec = encode_record(CLEAR, &[])?;
+        let rec = encode_record(consts::CLEAR, &[])?;
         self.append(&rec)?;
         self.map.clear();
         Ok(())
@@ -217,88 +263,5 @@ impl Store {
 }
 
 fn main() {
-    let mut store = match Store::new("save.bin") {
-        Ok(s) => s,
-
-        Err(e) => {
-            eprintln!("Failed to open store: {e}");
-            std::process::exit(1);
-        },
-    };
-
-    io::stdout().flush().expect("Failed to flush stdout");
-
-    let mut conf_clear = false;
-
-    loop {
-        print!("> ");
-        io::stdout().flush().expect("Failed to flush stdout");
-
-        let mut input = String::new();
-        let bytes = io::stdin().read_line(&mut input).expect("Failed to read line");
-
-        if bytes==0 {
-            break;
-        }
-
-        let args: Vec<&str> = input.split_whitespace().collect();
-
-        //replacement for if/else chains
-        match args.as_slice() {
-            ["put", key, value] => {
-                store.put(key.to_string(), value.to_string()).expect("Failed to write key to store");
-                println!("Set key {key} to value {value} successfully");
-            }
-
-            ["get", key] => match store.get(&key.to_string()) {
-                Some(v) => {
-                    println!("Value at key {key}: {v}")
-                }
-                None => {
-                    println!("Key {key} not found.")
-                }
-            }
-
-            ["del", key] => match store.del(key).expect("Failed to write deletion of key") {
-                Some(_) => {
-                    println!("Key {key} deleted successfully")
-                }
-
-                None => {
-                    println!("Key {key} not found")
-                }
-            } 
-
-            ["list"] => {
-                for key in store.map.keys() {
-                    println!("{}", key)
-                }
-            }
-
-            ["exit"] => {
-                break;
-            }
-
-            ["clear"] => {
-                if !conf_clear {
-                    println!("Are you sure you want to clear all keys? Retype 'clear' to confirm");
-                    conf_clear=true;
-                } else {
-                    match store.clear() {
-                        Ok(_) => {
-                            println!("Cleared all keys in the store successfully");
-                        },
-                        Err(_) => {
-                            println!("Failed to clear store.");
-                        },
-                    }
-                    conf_clear=false;
-                }
-            }
-
-            [] => {}//empty line
-            _ => println!("Unknown commmand")
-        }
-    }
-
+    examples::terminal();
 }
