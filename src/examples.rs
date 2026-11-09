@@ -102,6 +102,11 @@ pub fn terminal() {
                 }
             }
 
+            ["compact"] => match store.compact() {
+                Ok(()) => println!("Compacted log successfully"),
+                Err(e) => println!("Compation failed: {e}"),
+            }
+
             [] => {} //empty line
             _ => println!("Unknown commmand"),
         }

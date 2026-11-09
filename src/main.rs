@@ -1,4 +1,4 @@
-use chrono::{Utc};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -64,6 +64,8 @@ struct Store {
 
     //file handle to write updates in real time
     log: BufWriter<File>,
+
+    record_count: u64
 }
 
 impl Store {
@@ -141,6 +143,7 @@ impl Store {
                         report.bad_ranges.push(range); //last len was verified
                     }
                     pos = end;
+                    self.record_count += 1;
                 }
 
                 load::Rec::BadCrc { end } => {
@@ -178,11 +181,13 @@ impl Store {
     }
 
     fn open(path: &str, repair: bool) -> io::Result<(Self, load::LoadReport)> {
+        let _ = fs::remove_file(format!("{path}.compact.tmp"));
+
         let file = OpenOptions::new().append(true).create(true).open(path)?;
 
         if repair {
             let stamp = Utc::now().format("%Y%m%d-%H%M%S");
-            let fpath = format!("{path}.{stamp}.bak"); 
+            let fpath = format!("{path}.{stamp}.bak");
 
             fs::copy(path, fpath)?;
         }
@@ -191,6 +196,7 @@ impl Store {
             map: HashMap::new(),
             save_directory: path.to_string(),
             log: BufWriter::new(file),
+            record_count: 0,
         };
 
         let report = store.load(repair)?;
@@ -206,6 +212,39 @@ impl Store {
         }
 
         Ok((store, report))
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        self.log.flush()?;
+
+        let temp_path = format!("{}.compact.tmp", self.save_directory);
+
+        {
+            let mut out = BufWriter::new(File::create(&temp_path)?);
+
+            for (k, v) in &self.map {
+                let rec = encode_record(consts::PUT, &[k.as_str(), v.as_str()])?;
+                out.write(&rec)?;
+            }
+
+            fs::rename(&temp_path, &self.save_directory)?;
+
+            let file = OpenOptions::new().append(true).open(&self.save_directory)?;
+            self.log = BufWriter::new(file);
+            self.record_count = self.map.len() as u64;
+
+            Ok(())
+        }
+    }
+
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        let live = self.map.len() as u64;
+
+        if self.record_count > consts::COMPACT_MIN_RECORDS && self.record_count > 2 * live {
+            self.compact()?;
+        }
+
+        Ok(())
     }
 
     //constructor
@@ -228,6 +267,7 @@ impl Store {
         self.log.write_all(rec)?;
         self.log.flush()?;
         // self.log.get_ref().sync_data()?; //for extra durability, but slow
+        self.record_count += 1;
         Ok(())
     }
 
