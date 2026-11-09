@@ -14,13 +14,15 @@ I built it as a way to learn rust and also to understand how log structured stor
 - **Compation**: the log is rewritted with only live entries, automatically once it reaches more than 1000 records and more than twice the number of records then live keys, or on demand with `compact`. The rewrite goes through a temp file and an atomic rename, so no data loss if theres a crash mid compaction.
 
 ## Getting Started
-You need a rust toolchain ([rustup.rs](https://rustup.rs)).
+To build it yourself, you need a rust toolchain ([rustup.rs](https://rustup.rs)).
 
 ```sh
 git clone https://github.com/Nugget15183/Stash
 cd Stash
 cargo run
 ```
+
+To download it, simply go to the releases page ([Releases](https://github.com/Nugget15183/Stash/releases/tag/alpha)) and download the most recent release then run it.
 
 Stash reads and writes `save.bin` in the directory you run it from. Run it from the project root so you always use the same file.
 

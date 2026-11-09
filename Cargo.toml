@@ -2,6 +2,13 @@
 name = "Stash"
 version = "0.1.0"
 edition = "2024"
+description = "A small persistent key-value store with a checksummed append-only log"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
 
 [dependencies]
 crc32fast = "1.5.4"
